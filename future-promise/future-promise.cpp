@@ -2,12 +2,11 @@
 
 #include "stdafx.h"
 
+//////////////////////////////////////////////////////////////////////////
+// Future / Promise
+
 #include <memory>
 #include <functional>
-#include <queue>
-
-//////////////////////////////////////////////////////////////////////////
-// Synchronization context
 
 class synch_context
 {
@@ -15,128 +14,6 @@ public:
     virtual ~synch_context() {}
     virtual void post(const std::function<void()>& continuation) = 0;
 };
-
-class dummy_synch_context : public synch_context
-{
-public:
-    dummy_synch_context() {}
-
-    void post(const std::function<void()>& continuation) override
-    {
-        continuation();
-    }
-};
-
-class queued_synch_context : public synch_context
-{
-private:
-    std::queue<std::function<void()>> queue_;
-
-public:
-    queued_synch_context() {}
-
-    void post(const std::function<void()>& continuation) override
-    {
-        queue_.push(continuation);
-    }
-
-    void consume()
-    {
-        while (!queue_.empty())
-        {
-            auto& continuation = queue_.front();
-
-            continuation();
-
-            queue_.pop();
-        }
-    }
-};
-
-#ifdef WIN32
-class threaded_synch_context : public synch_context
-{
-private:
-    std::queue<std::function<void()>> queue_;
-    std::stack<std::thread> threads_;
-    std::mutex lock_;
-    std::condition_variable cv_;
-    volatile bool abort_;
-
-    void entry()
-    {
-        while (!abort_)
-        {
-            std::unique_lock<std::mutex> lock(lock_);
-
-            if (queue_.empty())
-            {
-                cv_.wait(lock);
-
-                if (queue_.empty())
-                {
-                    continue;
-                }
-            }
-
-            auto continuation = queue_.front();
-            queue_.pop();
-
-            lock.unlock();
-
-            continuation();
-        }
-    }
-
-    static void trampoline(threaded_synch_context* pt)
-    {
-        pt->entry();
-    }
-
-public:
-    threaded_synch_context(int threads)
-        :abort_(false)
-    {
-        for (auto i = 0; i < threads; i++)
-        {
-            threads_.push(std::thread(trampoline, this));
-        }
-    }
-
-    ~threaded_synch_context()
-    {
-        join();
-    }
-
-    void post(const std::function<void()>& continuation) override
-    {
-        std::lock_guard<std::mutex> lock(lock_);
-        queue_.push(continuation);
-
-        if (queue_.size() == 1)
-        {
-            cv_.notify_one();
-        }
-    }
-
-    void join()
-    {
-        abort_ = true;
-        cv_.notify_all();
-
-        while (!threads_.empty())
-        {
-            auto& t = threads_.top();
-            t.join();
-
-            threads_.pop();
-        }
-    }
-};
-#endif
-
-//////////////////////////////////////////////////////////////////////////
-// Future / Promise
 
 template <typename T> class future;
 template <typename T> class promise;
@@ -349,14 +226,139 @@ public:
 };
 
 //////////////////////////////////////////////////////////////////////////
+// Synchronization context
+
+class dummy_synch_context : public synch_context
+{
+public:
+    dummy_synch_context() {}
+
+    void post(const std::function<void()>& continuation) override
+    {
+        continuation();
+    }
+};
+
+#include <queue>
+
+class queued_synch_context : public synch_context
+{
+private:
+    std::queue<std::function<void()>> queue_;
+
+public:
+    queued_synch_context() {}
+
+    void post(const std::function<void()>& continuation) override
+    {
+        queue_.push(continuation);
+    }
+
+    void consume()
+    {
+        while (!queue_.empty())
+        {
+            auto& continuation = queue_.front();
+
+            continuation();
+
+            queue_.pop();
+        }
+    }
+};
+
+#ifdef WIN32
+
+#include <stack>
+#include <mutex>
+#include <thread>
+
+class threaded_synch_context : public synch_context
+{
+private:
+    std::queue<std::function<void()>> queue_;
+    std::stack<std::thread> threads_;
+    std::mutex lock_;
+    std::condition_variable cv_;
+    volatile bool abort_;
+
+    void entry()
+    {
+        while (!abort_)
+        {
+            std::unique_lock<std::mutex> lock(lock_);
+
+            if (queue_.empty())
+            {
+                cv_.wait(lock);
+
+                if (queue_.empty())
+                {
+                    continue;
+                }
+            }
+
+            auto continuation = queue_.front();
+            queue_.pop();
+
+            lock.unlock();
+
+            continuation();
+        }
+    }
+
+    static void trampoline(threaded_synch_context* pt)
+    {
+        pt->entry();
+    }
+
+public:
+    threaded_synch_context(int threads)
+        :abort_(false)
+    {
+        for (auto i = 0; i < threads; i++)
+        {
+            threads_.push(std::thread(trampoline, this));
+        }
+    }
+
+    ~threaded_synch_context()
+    {
+        join();
+    }
+
+    void post(const std::function<void()>& continuation) override
+    {
+        std::lock_guard<std::mutex> lock(lock_);
+        queue_.push(continuation);
+
+        if (queue_.size() == 1)
+        {
+            cv_.notify_one();
+        }
+    }
+
+    void join()
+    {
+        abort_ = true;
+        cv_.notify_all();
+
+        while (!threads_.empty())
+        {
+            auto& t = threads_.top();
+            t.join();
+
+            threads_.pop();
+        }
+    }
+};
+#endif
+
+//////////////////////////////////////////////////////////////////////////
 // Test code
 
-static void test()
+static void test(const std::shared_ptr<synch_context>& scPtr)
 {
-    //auto scPtr = std::make_shared<dummy_synch_context>();
-    //auto scPtr = std::make_shared<queued_synch_context>();
-    auto scPtr = std::make_shared<threaded_synch_context>(10);
-
     {
         promise<int> p(scPtr);
         auto f = p.get_future();
@@ -390,6 +392,15 @@ static void test()
 
         p.set_value(123);
     }
+}
+
+static void test()
+{
+    //auto scPtr = std::make_shared<dummy_synch_context>();
+    //auto scPtr = std::make_shared<queued_synch_context>();
+    auto scPtr = std::make_shared<threaded_synch_context>(10);
+
+    test(scPtr);
 
     //scPtr->consume();
     scPtr->join();
