@@ -53,10 +53,18 @@ private:
     {
     }
 
+    explicit future_core(const T& result, const std::shared_ptr<synch_context>& scPtr)
+        : count_(1), finished_(true), ready_(false), result_(result), scPtr_(scPtr)
+    {
+    }
+
+private:
     future_core* add_ref() const
     {
         count_++;
-        //printf("add_ref: %d\n", count_);
+#ifdef _DEBUG
+        printf("add_ref: %d\n", count_);
+#endif
         return const_cast<future_core*>(this);
     }
 
@@ -67,7 +75,9 @@ private:
         {
             delete this;
         }
-        //printf("release: %d\n", c);
+#ifdef _DEBUG
+        printf("release: %d\n", c);
+#endif
     }
 
     void do_continuation() const
@@ -75,7 +85,11 @@ private:
         if (finished_ && ready_)
         {
             add_ref();
-            scPtr_->post([this]() { continuation_(result_); release(); });
+            scPtr_->post([this]()
+            {
+                continuation_(result_);
+                release();
+            });
         }
     }
 
@@ -102,7 +116,29 @@ private:
         auto pf = new future_core<U>(scPtr_);
         std::function<U(const T&)> m(mapper);
 
-        then([pf, m](auto value) { pf->set_value(m(value)); pf->release(); });
+        then([pf, m](auto value)
+        {
+            pf->set_value(m(value));
+            pf->release();
+        });
+
+        return future<U>(pf);
+    }
+
+    template <typename U> future<U> bind(const std::function<future<U>(const T&)>& binder)
+    {
+        auto pf = new future_core<U>(scPtr_);
+        std::function<future<U>(const T&)> b(binder);
+
+        then([pf, b](auto value)
+        {
+            auto pf2 = b(value);
+            pf2.then([pf](auto value2)
+            {
+                pf->set_value(value2);
+                pf->release();
+            });
+        });
 
         return future<U>(pf);
     }
@@ -120,6 +156,11 @@ private:
 
     future(future_core<T>* pFuture)
         :pFuture_(pFuture->add_ref())
+    {
+    }
+
+    future(const T& value, const std::shared_ptr<synch_context>& scPtr)
+        :pFuture_(new future_core<T>(value, scPtr))
     {
     }
 
@@ -157,6 +198,16 @@ public:
     {
         return pFuture_->map(mapper);
     }
+
+    template <typename U> future<U> bind(const std::function<future<U>(const T&)>& binder)
+    {
+        return pFuture_->bind(binder);
+    }
+
+    static future<T> result(const T& value, const std::shared_ptr<synch_context>& scPtr)
+    {
+        return future<T>(value, scPtr);
+    }
 };
 
 template <typename T> class promise
@@ -165,7 +216,7 @@ private:
     future_core<T>* pFuture_;
 
 public:
-    promise(const std::shared_ptr<synch_context> scPtr)
+    promise(const std::shared_ptr<synch_context>& scPtr)
         : pFuture_(new future_core<T>(scPtr))
     {
     }
@@ -216,6 +267,15 @@ static void test()
         auto f1 = p.get_future();
         auto f2 = f1.map<int>([](auto value) { return value + 1; });
         f2.then([](auto value) { printf("value3=%d\n", value); });
+
+        p.set_value(123);
+    }
+
+    {
+        promise<int> p(scPtr);
+        auto f1 = p.get_future();
+        auto f2 = f1.bind<int>([scPtr](auto value) { return future<int>::result(value + 2, scPtr); });
+        f2.then([](auto value) { printf("value4=%d\n", value); });
 
         p.set_value(123);
     }

@@ -1,1 +1,1 @@
-future-promise
+# future-promise implements at C++ from scratch
