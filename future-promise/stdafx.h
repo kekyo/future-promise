@@ -11,6 +11,17 @@
 #include <crtdbg.h>
 #endif
 
+/////////////////////////////////
+
 #include <memory>
 #include <functional>
 #include <queue>
+
+/////////////////////////////////
+
+#include <windows.h>
+
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <stack>

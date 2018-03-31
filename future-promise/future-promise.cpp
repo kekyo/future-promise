@@ -6,15 +6,36 @@
 #include <functional>
 #include <queue>
 
+//////////////////////////////////////////////////////////////////////////
+// Synchronization context
+
 class synch_context
+{
+public:
+    virtual ~synch_context() {}
+    virtual void post(const std::function<void()>& continuation) = 0;
+};
+
+class dummy_synch_context : public synch_context
+{
+public:
+    dummy_synch_context() {}
+
+    void post(const std::function<void()>& continuation) override
+    {
+        continuation();
+    }
+};
+
+class queued_synch_context : public synch_context
 {
 private:
     std::queue<std::function<void()>> queue_;
 
 public:
-    synch_context() {}
+    queued_synch_context() {}
 
-    void post(const std::function<void()>& continuation)
+    void post(const std::function<void()>& continuation) override
     {
         queue_.push(continuation);
     }
@@ -32,6 +53,91 @@ public:
     }
 };
 
+#ifdef WIN32
+class threaded_synch_context : public synch_context
+{
+private:
+    std::queue<std::function<void()>> queue_;
+    std::stack<std::thread> threads_;
+    std::mutex lock_;
+    std::condition_variable cv_;
+    volatile bool abort_;
+
+    void entry()
+    {
+        while (!abort_)
+        {
+            std::unique_lock<std::mutex> lock(lock_);
+
+            if (queue_.empty())
+            {
+                cv_.wait(lock);
+
+                if (queue_.empty())
+                {
+                    continue;
+                }
+            }
+
+            auto continuation = queue_.front();
+            queue_.pop();
+
+            lock.unlock();
+
+            continuation();
+        }
+    }
+
+    static void trampoline(threaded_synch_context* pt)
+    {
+        pt->entry();
+    }
+
+public:
+    threaded_synch_context(int threads)
+        :abort_(false)
+    {
+        for (auto i = 0; i < threads; i++)
+        {
+            threads_.push(std::thread(trampoline, this));
+        }
+    }
+
+    ~threaded_synch_context()
+    {
+        join();
+    }
+
+    void post(const std::function<void()>& continuation) override
+    {
+        std::lock_guard<std::mutex> lock(lock_);
+        queue_.push(continuation);
+
+        if (queue_.size() == 1)
+        {
+            cv_.notify_one();
+        }
+    }
+
+    void join()
+    {
+        abort_ = true;
+        cv_.notify_all();
+
+        while (!threads_.empty())
+        {
+            auto& t = threads_.top();
+            t.join();
+
+            threads_.pop();
+        }
+    }
+};
+#endif
+
+//////////////////////////////////////////////////////////////////////////
+// Future / Promise
+
 template <typename T> class future;
 template <typename T> class promise;
 
@@ -41,7 +147,7 @@ template <typename T> class future_core
     friend class promise<T>;
 
 private:
-    volatile mutable int count_;
+    mutable std::atomic_int count_;
     volatile bool finished_;
     volatile bool ready_;
     T result_;
@@ -61,9 +167,9 @@ private:
 private:
     future_core* add_ref() const
     {
-        count_++;
+        auto c = ++count_;
 #ifdef _DEBUG
-        printf("add_ref: %d\n", count_);
+        printf("add_ref: %d\n", c);
 #endif
         return const_cast<future_core*>(this);
     }
@@ -216,12 +322,12 @@ private:
     future_core<T>* pFuture_;
 
 public:
-    promise(const std::shared_ptr<synch_context>& scPtr)
+    explicit promise(const std::shared_ptr<synch_context>& scPtr)
         : pFuture_(new future_core<T>(scPtr))
     {
     }
 
-    promise(const promise<T>& rhs)
+    explicit promise(const promise<T>& rhs)
         : pFuture_(rhs.pFuture_->add_ref())
     {
     }
@@ -242,14 +348,19 @@ public:
     }
 };
 
+//////////////////////////////////////////////////////////////////////////
+// Test code
+
 static void test()
 {
-    auto scPtr = std::make_shared<synch_context>();
+    //auto scPtr = std::make_shared<dummy_synch_context>();
+    //auto scPtr = std::make_shared<queued_synch_context>();
+    auto scPtr = std::make_shared<threaded_synch_context>(10);
 
     {
         promise<int> p(scPtr);
         auto f = p.get_future();
-        f.then([](auto value) { printf("value1=%d\n", value); });
+        f.then([](auto value) { printf("value1=%d, %d\n", value, ::GetCurrentThreadId()); });
 
         p.set_value(123);
     }
@@ -259,14 +370,14 @@ static void test()
         p.set_value(456);
 
         auto f = p.get_future();
-        f.then([](auto value) { printf("value2=%d\n", value); });
+        f.then([](auto value) { printf("value2=%d, %d\n", value, ::GetCurrentThreadId()); });
     }
 
     {
         promise<int> p(scPtr);
         auto f1 = p.get_future();
         auto f2 = f1.map<int>([](auto value) { return value + 1; });
-        f2.then([](auto value) { printf("value3=%d\n", value); });
+        f2.then([](auto value) { printf("value3=%d, %d\n", value, ::GetCurrentThreadId()); });
 
         p.set_value(123);
     }
@@ -275,12 +386,13 @@ static void test()
         promise<int> p(scPtr);
         auto f1 = p.get_future();
         auto f2 = f1.bind<int>([scPtr](auto value) { return future<int>::result(value + 2, scPtr); });
-        f2.then([](auto value) { printf("value4=%d\n", value); });
+        f2.then([](auto value) { printf("value4=%d, %d\n", value, ::GetCurrentThreadId()); });
 
         p.set_value(123);
     }
 
-    scPtr->consume();
+    //scPtr->consume();
+    scPtr->join();
 }
 
 int main()
