@@ -90,6 +90,9 @@ static void test_threaded()
     scPtr->join();
 }
 
+// Not use in these tests.
+DECLARE_DEFAULE_SYNCH_CONTEXT(std::make_shared<queued_synch_context>());
+
 int main()
 {
 #ifdef _CRTDBG_ALLOC_MEM_DF
